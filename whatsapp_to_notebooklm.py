@@ -27,6 +27,18 @@ class WhatsAppToNotebookLM:
         # Find the chat text file
         self.chat_file = self.find_chat_file()
         
+        # Index media files once so per-line parsing does constant-time lookups.
+        self.media_files = {
+            file_path.name: file_path
+            for file_path in self.chat_folder.iterdir()
+            if file_path.is_file() and file_path.name != self.chat_file.name
+        }
+        self.attachment_pattern = re.compile(r'<attached:\s*([^>]+)>', re.IGNORECASE)
+        self.filename_candidate_pattern = re.compile(
+            r'([A-Za-z0-9][A-Za-z0-9 _().-]*\.[A-Za-z0-9]{1,8})'
+        )
+        self.image_markdown_cache = {}
+        
     def find_chat_file(self):
         """Find the WhatsApp chat text file"""
         txt_files = list(self.chat_folder.glob("*.txt"))
@@ -40,33 +52,61 @@ class WhatsAppToNotebookLM:
     
     def parse_whatsapp_date(self, line):
         """Extract date from WhatsApp message line"""
-        # Common WhatsApp date patterns
-        patterns = [
-            r'(\d{1,2}/\d{1,2}/\d{2,4}),\s*\d{1,2}:\d{2}',  # MM/DD/YY or MM/DD/YYYY
-            r'(\d{1,2}/\d{1,2}/\d{2,4})\s*\d{1,2}:\d{2}',   # Without comma
-            r'(\d{4}-\d{2}-\d{2})\s*\d{2}:\d{2}',           # YYYY-MM-DD
-            r'(\d{1,2}\.\d{1,2}\.\d{2,4}),\s*\d{1,2}:\d{2}', # DD.MM.YY
-            r'\[(\d{1,2}/\d{1,2}/\d{2,4}),\s*\d{1,2}:\d{2}', # [MM/DD/YY format
+        # WhatsApp exports may include invisible direction marks at the start of
+        # a line and special spaces before AM/PM. Normalize those first.
+        normalized_line = line.strip().lstrip('\u200e\u200f\u2066\u2067\u2068\u2069')
+        normalized_line = normalized_line.replace('\u202f', ' ').replace('\xa0', ' ')
+
+        date_patterns = [
+            (
+                r'^\[?(\d{1,2}/\d{1,2}/\d{4}),\s*\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M\]?',
+                ['%d/%m/%Y', '%m/%d/%Y'],
+            ),
+            (
+                r'^\[?(\d{1,2}/\d{1,2}/\d{2}),\s*\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M\]?',
+                ['%d/%m/%y', '%m/%d/%y'],
+            ),
+            (
+                r'^\[?(\d{1,2}-\d{1,2}-\d{4}),\s*\d{1,2}:\d{2}(?::\d{2})?\]?',
+                ['%d-%m-%Y', '%m-%d-%Y'],
+            ),
+            (
+                r'^\[?(\d{1,2}-\d{1,2}-\d{2}),\s*\d{1,2}:\d{2}(?::\d{2})?\]?',
+                ['%d-%m-%y', '%m-%d-%y'],
+            ),
+            (
+                r'^\[?(\d{1,2}\.\d{1,2}\.\d{4}),\s*\d{1,2}:\d{2}(?::\d{2})?\]?',
+                ['%d.%m.%Y', '%m.%d.%Y'],
+            ),
+            (
+                r'^\[?(\d{1,2}\.\d{1,2}\.\d{2}),\s*\d{1,2}:\d{2}(?::\d{2})?\]?',
+                ['%d.%m.%y', '%m.%d.%y'],
+            ),
+            (
+                r'^\[?(\d{4}-\d{2}-\d{2}),\s*\d{1,2}:\d{2}(?::\d{2})?\]?',
+                ['%Y-%m-%d'],
+            ),
         ]
-        
-        for pattern in patterns:
-            match = re.match(pattern, line.strip())
-            if match:
-                date_str = match.group(1)
+
+        for pattern, formats in date_patterns:
+            match = re.match(pattern, normalized_line, flags=re.IGNORECASE)
+            if not match:
+                continue
+
+            date_str = match.group(1)
+            for fmt in formats:
                 try:
-                    # Try different date formats
-                    for fmt in ['%m/%d/%Y', '%m/%d/%y', '%Y-%m-%d', '%d.%m.%Y', '%d.%m.%y']:
-                        try:
-                            return datetime.strptime(date_str, fmt)
-                        except ValueError:
-                            continue
+                    return datetime.strptime(date_str, fmt)
                 except ValueError:
-                    pass
+                    continue
         return None
     
     def get_image_markdown(self, filename):
         """Convert image to base64 markdown format"""
-        media_path = self.chat_folder / filename
+        if filename in self.image_markdown_cache:
+            return self.image_markdown_cache[filename]
+
+        media_path = self.media_files.get(filename, self.chat_folder / filename)
         if not media_path.exists():
             return f"![Image not found: {filename}]"
         
@@ -84,7 +124,9 @@ class WhatsAppToNotebookLM:
             mime_type = mime_types.get(ext, 'image/jpeg')
             
             # Return markdown image with base64 data
-            return f"![{filename}](data:{mime_type};base64,{base64_data})"
+            markdown = f"![{filename}](data:{mime_type};base64,{base64_data})"
+            self.image_markdown_cache[filename] = markdown
+            return markdown
             
         except Exception as e:
             print(f"Error encoding {filename}: {e}")
@@ -93,13 +135,20 @@ class WhatsAppToNotebookLM:
     def find_media_references(self, line):
         """Find media file references in a line of text"""
         media_files = []
-        
-        # Check if line contains any filenames that exist in the folder
-        for file_path in self.chat_folder.iterdir():
-            if file_path.is_file() and file_path.name != self.chat_file.name:
-                if file_path.name in line:
-                    media_files.append(file_path.name)
-        
+        seen = set()
+
+        for match in self.attachment_pattern.findall(line):
+            filename = match.strip()
+            if filename in self.media_files and filename not in seen:
+                media_files.append(filename)
+                seen.add(filename)
+
+        for match in self.filename_candidate_pattern.findall(line):
+            filename = match.strip()
+            if filename in self.media_files and filename not in seen:
+                media_files.append(filename)
+                seen.add(filename)
+
         return media_files
     
     def process_chat(self):
@@ -158,10 +207,12 @@ class WhatsAppToNotebookLM:
         month_name = month_names.get(month_num, f"Month{month_num}")
         markdown_file = self.output_folder / f"WhatsApp_Chat_{month_name}_{year}.md"
         
-        markdown_content = f"# WhatsApp Chat - {month_name} {year}\n\n"
-        markdown_content += f"*Generated from WhatsApp export*\n\n"
-        markdown_content += f"**Period:** {month_name} {year}\n\n"
-        markdown_content += "---\n\n"
+        markdown_parts = [
+            f"# WhatsApp Chat - {month_name} {year}\n\n",
+            "*Generated from WhatsApp export*\n\n",
+            f"**Period:** {month_name} {year}\n\n",
+            "---\n\n",
+        ]
         
         media_files_copied = []
         
@@ -211,22 +262,22 @@ class WhatsAppToNotebookLM:
             
             # Add the processed line to markdown (escape special markdown characters in the text part)
             if processed_line != line:  # If we made changes, it likely has media
-                markdown_content += processed_line + "\n\n"
+                markdown_parts.append(processed_line + "\n\n")
             else:
                 # Escape markdown special characters for regular text
                 escaped_line = processed_line.replace('*', '\\*').replace('_', '\\_').replace('#', '\\#')
-                markdown_content += escaped_line + "\n\n"
+                markdown_parts.append(escaped_line + "\n\n")
         
         # Add summary of media files at the end
         if media_files_copied:
-            markdown_content += "\n---\n\n## Media Content Summary\n\n"
-            markdown_content += f"This chat contained various media files that were referenced but not uploaded to NotebookLM:\n\n"
-            markdown_content += "- **Images**: Embedded directly in this document\n"
-            markdown_content += "- **Videos/Audio/Documents**: Referenced by filename only\n\n"
+            markdown_parts.append("\n---\n\n## Media Content Summary\n\n")
+            markdown_parts.append("This chat contained various media files that were referenced but not uploaded to NotebookLM:\n\n")
+            markdown_parts.append("- **Images**: Embedded directly in this document\n")
+            markdown_parts.append("- **Videos/Audio/Documents**: Referenced by filename only\n\n")
         
         # Write markdown file
         with open(markdown_file, 'w', encoding='utf-8') as f:
-            f.write(markdown_content)
+            f.write(''.join(markdown_parts))
         
         print(f"Created: {markdown_file.name}")
 
